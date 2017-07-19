@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/cloudflare/golibs/lrucache"
-	"github.com/oschwald/geoip2-golang"
 	"github.com/phuslu/glog"
+	"github.com/wangtuanjie/ip17mon"
 
 	"../../filters"
 	"../../helpers"
@@ -30,15 +30,17 @@ type Config struct {
 		Rules   map[string]string
 	}
 	RegionFilters struct {
-		Enabled      bool
-		DataFile     string
-		DNSServer    string
-		DNSCacheSize int
-		Rules        map[string]string
+		Enabled         bool
+		DataFile        string
+		EnableRemoteDNS bool
+		DNSServer       string
+		DNSCacheSize    int
+		Rules           map[string]string
 	}
 	IndexFiles struct {
-		Enabled bool
-		Files   []string
+		Enabled    bool
+		ServerName string
+		Files      []string
 	}
 	GFWList struct {
 		Enabled  bool
@@ -77,6 +79,7 @@ type Filter struct {
 	Config
 	Store                storage.Store
 	IndexFilesEnabled    bool
+	IndexServerName      string
 	IndexFiles           []string
 	IndexFilesSet        map[string]struct{}
 	ProxyPacCache        lrucache.Cache
@@ -92,32 +95,25 @@ type Filter struct {
 	RegionFiltersEnabled bool
 	RegionFiltersRules   map[string]filters.RoundTripFilter
 	RegionResolver       *helpers.Resolver
-	RegionPrivateNets    []*net.IPNet
-	RegionLocator        *geoip2.Reader
+	RegionLocator        *ip17mon.Locator
 	RegionFilterCache    lrucache.Cache
 	Transport            *http.Transport
 }
 
 func init() {
-	filename := filterName + ".json"
-	config := new(Config)
-	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
-	if err != nil {
-		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
-	}
-
-	err = filters.Register(filterName, &filters.RegisteredFilter{
-		New: func() (filters.Filter, error) {
-			return NewFilter(config)
-		},
-	})
-
-	if err != nil {
-		glog.Fatalf("Register(%#v) error: %s", filterName, err)
-	}
-
 	mime.AddExtensionType(".crt", "application/x-x509-ca-cert")
 	mime.AddExtensionType(".mobileconfig", "application/x-apple-aspen-config")
+
+	filters.Register(filterName, func() (filters.Filter, error) {
+		filename := filterName + ".json"
+		config := new(Config)
+		err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
+		if err != nil {
+			glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
+		}
+
+		return NewFilter(config)
+	})
 }
 
 func NewFilter(config *Config) (_ filters.Filter, err error) {
@@ -147,6 +143,7 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 		Config:               *config,
 		Store:                store,
 		IndexFilesEnabled:    config.IndexFiles.Enabled,
+		IndexServerName:      config.IndexFiles.ServerName,
 		IndexFiles:           config.IndexFiles.Files,
 		IndexFilesSet:        make(map[string]struct{}),
 		ProxyPacCache:        lrucache.NewLRUCache(32),
@@ -196,22 +193,10 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 			glog.Fatalf("AUTOPROXY: ioutil.ReadAll(%#v) error: %v", resp.Body, err)
 		}
 
-		f.RegionLocator, err = geoip2.FromBytes(data)
-		if err != nil {
-			glog.Fatalf("AUTOPROXY: geoip2.FromBytes(%#v) error: %v", resp.Body, err)
-		}
-
-		f.RegionPrivateNets = make([]*net.IPNet, 0, 4)
-		for _, network := range []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.1/8"} {
-			_, n, err := net.ParseCIDR(network)
-			if err != nil {
-				glog.Fatalf("AUTOPROXY: net.ParseCIDR(%#v) error: %v", network, err)
-			}
-			f.RegionPrivateNets = append(f.RegionPrivateNets, n)
-		}
+		f.RegionLocator = ip17mon.NewLocatorWithData(data)
 
 		f.RegionResolver = &helpers.Resolver{}
-		if config.RegionFilters.DNSServer != "" {
+		if config.RegionFilters.EnableRemoteDNS {
 			f.RegionResolver.DNSServer = net.ParseIP(config.RegionFilters.DNSServer)
 			if f.RegionResolver.DNSServer == nil {
 				glog.Fatalf("AUTOPROXY: net.ParseIP(%+v) failed", config.RegionFilters.DNSServer)
@@ -231,7 +216,7 @@ func NewFilter(config *Config) (_ filters.Filter, err error) {
 			if !ok {
 				glog.Fatalf("AUTOPROXY: filters.GetFilter(%#v) return %T, not a RoundTripFilter", name, f)
 			}
-			fm[strings.ToUpper(region)] = f1
+			fm[strings.ToLower(region)] = f1
 		}
 		f.RegionFiltersRules = fm
 
@@ -249,23 +234,22 @@ func (f *Filter) FilterName() string {
 	return filterName
 }
 
-func (f *Filter) IsPrivateIP(ip net.IP) bool {
-	for _, cidr := range f.RegionPrivateNets {
-		if cidr.Contains(ip) {
-			return true
-		}
-	}
-
-	return false
-}
-
-func (f *Filter) FindCountryByIP(ip net.IP) (string, error) {
-	info, err := f.RegionLocator.Country(ip)
+func (f *Filter) FindCountryByIP(ip string) (string, error) {
+	li, err := f.RegionLocator.Find(ip)
 	if err != nil {
 		return "", err
 	}
 
-	return info.Country.IsoCode, nil
+	//FIXME: Who should be ashamed?
+	switch li.Country {
+	case "中国":
+		switch li.Region {
+		case "台湾", "香港":
+			li.Country = li.Region
+		}
+	}
+
+	return li.Country, nil
 }
 
 func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Context, *http.Request, error) {
@@ -299,27 +283,20 @@ func (f *Filter) Request(ctx context.Context, req *http.Request) (context.Contex
 			ip := ips[0]
 
 			if ip.IsLoopback() && !(strings.Contains(host, ".local") || strings.Contains(host, "localhost.")) {
-				glog.V(2).Infof("%s \"AUTOPROXY RegionFilters Loopback %s %s %s\" with nil", req.RemoteAddr, req.Method, req.URL.String(), req.Proto)
+				glog.V(2).Infof("%s \"AUTOPROXY RegionFilters BYPASS Loopback %s %s %s\" with nil", req.RemoteAddr, req.Method, req.URL.String(), req.Proto)
 				f.RegionFilterCache.Set(host, nil, time.Now().Add(time.Hour))
-			} else if f.IsPrivateIP(ip) {
-				if f1, ok := f.RegionFiltersRules["PRIVATE"]; ok {
-					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters Private %s %s %s\" with %T", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, f1)
-					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
-					filters.SetRoundTripFilter(ctx, f1)
-				}
 			} else if ip.To4() == nil {
-				if f1, ok := f.RegionFiltersRules["IPV6"]; ok {
+				if f1, ok := f.RegionFiltersRules["ipv6"]; ok {
 					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters IPv6 %s %s %s\" with %T", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, f1)
 					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
 					filters.SetRoundTripFilter(ctx, f1)
 				}
-			} else if country, err := f.FindCountryByIP(ip); err == nil {
-				glog.V(3).Infof("AUTOPROXY FindCountryByIP(%+v) return %+v", ip, country)
+			} else if country, err := f.FindCountryByIP(ip.String()); err == nil {
 				if f1, ok := f.RegionFiltersRules[country]; ok {
 					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters %s %s %s %s\" with %T", req.RemoteAddr, country, req.Method, req.URL.String(), req.Proto, f1)
 					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
 					filters.SetRoundTripFilter(ctx, f1)
-				} else if f1, ok := f.RegionFiltersRules["DEFAULT"]; ok {
+				} else if f1, ok := f.RegionFiltersRules["default"]; ok {
 					glog.V(2).Infof("%s \"AUTOPROXY RegionFilters Default %s %s %s\" with %T", req.RemoteAddr, req.Method, req.URL.String(), req.Proto, f1)
 					f.RegionFilterCache.Set(host, f1, time.Now().Add(time.Hour))
 					filters.SetRoundTripFilter(ctx, f1)
@@ -349,21 +326,23 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 		}
 	}
 
-	if req.URL.Host == "" && req.RequestURI[0] == '/' && f.IndexFilesEnabled {
-		if _, ok := f.IndexFilesSet[req.URL.Path[1:]]; ok || req.URL.Path == "/" {
-			switch {
-			case f.GFWListEnabled && strings.HasSuffix(req.URL.Path, ".pac"):
-				glog.V(2).Infof("%s \"AUTOPROXY ProxyPac %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.ProxyPacRoundTrip(ctx, req)
-			case f.MobileConfigEnabled && strings.HasSuffix(req.URL.Path, ".mobileconfig"):
-				glog.V(2).Infof("%s \"AUTOPROXY ProxyMobileConfig %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.ProxyMobileConfigRoundTrip(ctx, req)
-			case f.IPHTMLEnabled && req.URL.Path == "/ip.html":
-				glog.V(2).Infof("%s \"AUTOPROXY IPHTML %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.IPHTMLRoundTrip(ctx, req)
-			default:
-				glog.V(2).Infof("%s \"AUTOPROXY IndexFiles %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
-				return f.IndexFilesRoundTrip(ctx, req)
+	if f.IndexFilesEnabled {
+		if (req.URL.Host == "" && req.RequestURI[0] == '/') || (f.IndexServerName != "" && req.Host == f.IndexServerName) {
+			if _, ok := f.IndexFilesSet[req.URL.Path[1:]]; ok || req.URL.Path == "/" {
+				switch {
+				case f.GFWListEnabled && strings.HasSuffix(req.URL.Path, ".pac"):
+					glog.V(2).Infof("%s \"AUTOPROXY ProxyPac %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.ProxyPacRoundTrip(ctx, req)
+				case f.MobileConfigEnabled && strings.HasSuffix(req.URL.Path, ".mobileconfig"):
+					glog.V(2).Infof("%s \"AUTOPROXY ProxyMobileConfig %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.ProxyMobileConfigRoundTrip(ctx, req)
+				case f.IPHTMLEnabled && req.URL.Path == "/ip.html":
+					glog.V(2).Infof("%s \"AUTOPROXY IPHTML %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.IPHTMLRoundTrip(ctx, req)
+				default:
+					glog.V(2).Infof("%s \"AUTOPROXY IndexFiles %s %s %s\" - -", req.RemoteAddr, req.Method, req.RequestURI, req.Proto)
+					return f.IndexFilesRoundTrip(ctx, req)
+				}
 			}
 		}
 	}

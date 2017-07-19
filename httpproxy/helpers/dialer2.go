@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"fmt"
@@ -12,12 +13,13 @@ import (
 
 	"github.com/cloudflare/golibs/lrucache"
 	"github.com/phuslu/glog"
+	quic "github.com/phuslu/quic-go"
 )
 
 type MultiDialer struct {
-	Dialer interface {
-		Dial(network, addr string) (net.Conn, error)
-	}
+	KeepAlive         time.Duration
+	Timeout           time.Duration
+	DualStack         bool
 	Resolver          *Resolver
 	SSLVerify         bool
 	LogToStderr       bool
@@ -30,7 +32,8 @@ type MultiDialer struct {
 	TLSConnDuration   lrucache.Cache
 	TLSConnError      lrucache.Cache
 	TLSConnReadBuffer int
-	ConnExpiry        time.Duration
+	GoodConnExpiry    time.Duration
+	ErrorConnExpiry   time.Duration
 	Level             int
 }
 
@@ -40,7 +43,7 @@ func (d *MultiDialer) ClearCache() {
 	d.TLSConnError.Clear()
 }
 
-func (d *MultiDialer) LookupAlias(alias string) (addrs []string, err error) {
+func (d *MultiDialer) LookupAlias(alias string) (hosts []string, err error) {
 	names, ok := d.HostMap[alias]
 	if !ok {
 		return nil, fmt.Errorf("alias %#v not exists", alias)
@@ -48,18 +51,18 @@ func (d *MultiDialer) LookupAlias(alias string) (addrs []string, err error) {
 
 	seen := make(map[string]struct{}, 0)
 	for _, name := range names {
-		var addrs0 []string
+		var hosts0 []string
 		if net.ParseIP(name) != nil {
-			addrs0 = []string{name}
+			hosts0 = []string{name}
 		} else {
-			addrs0, err = d.Resolver.LookupHost(name)
+			hosts0, err = d.Resolver.LookupHost(name)
 			if err != nil {
 				glog.Warningf("LookupHost(%#v) error: %s", name, err)
-				addrs0 = []string{}
+				hosts0 = []string{}
 			}
 		}
-		for _, addr := range addrs0 {
-			seen[addr] = struct{}{}
+		for _, host := range hosts0 {
+			seen[host] = struct{}{}
 		}
 	}
 
@@ -67,24 +70,20 @@ func (d *MultiDialer) LookupAlias(alias string) (addrs []string, err error) {
 		return nil, err
 	}
 
-	addrs = make([]string, 0)
-	for addr := range seen {
-		if _, ok := d.IPBlackList.GetQuiet(addr); ok {
+	hosts = make([]string, 0)
+	for host := range seen {
+		if _, ok := d.IPBlackList.GetQuiet(host); ok {
 			continue
 		}
-		addrs = append(addrs, addr)
+		hosts = append(hosts, host)
 	}
 
-	if len(addrs) == 0 {
-		glog.Errorf("MULTIDIALER: LookupAlias(%#v) have no good ip addrs", alias)
-		return nil, fmt.Errorf("MULTIDIALER: LookupAlias(%#v) have no good ip addrs", alias)
+	if len(hosts) == 0 {
+		glog.Errorf("MULTIDIALER: LookupAlias(%#v) have no good ips", alias)
+		return nil, fmt.Errorf("MULTIDIALER: LookupAlias(%#v) have no good ips", alias)
 	}
 
-	return addrs, nil
-}
-
-func (d *MultiDialer) Dial(network, address string) (net.Conn, error) {
-	return d.Dialer.Dial(network, address)
+	return hosts, nil
 }
 
 func (d *MultiDialer) DialTLS(network, address string) (net.Conn, error) {
@@ -127,17 +126,13 @@ func (d *MultiDialer) DialTLS2(network, address string, cfg *tls.Config) (net.Co
 					}
 					glog.V(3).Infof("DialTLS2(%#v, %#v) alais=%#v set tls.Config=%#v", network, address, alias, config)
 
-					addrs := make([]string, len(hosts))
-					for i, host := range hosts {
-						addrs[i] = net.JoinHostPort(host, port)
-					}
 					switch {
 					case d.Resolver.ForceIPv6:
 						network = "tcp6"
 					case d.Resolver.DisableIPv6:
 						network = "tcp4"
 					}
-					conn, err := d.dialMultiTLS(network, addrs, config)
+					conn, err := d.dialMultiTLS(network, hosts, port, config)
 					if err != nil {
 						return nil, err
 					}
@@ -148,18 +143,22 @@ func (d *MultiDialer) DialTLS2(network, address string, cfg *tls.Config) (net.Co
 								return nil, fmt.Errorf("Wrong certificate of %s: PeerCertificates=%#v", conn.RemoteAddr(), certs)
 							}
 							cert := certs[1]
-							glog.V(3).Infof("MULTIDIALER DialTLS(%#v, %#v) verify cert=%v", network, address, cert.Subject)
-							if d.GoogleG2PKP != nil {
+							glog.V(3).Infof("MULTIDIALER DialTLS2(%#v, %#v) verify cert=%v", network, address, cert.Subject)
+							switch {
+							case d.GoogleG2PKP != nil:
 								pkp := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
-								if !bytes.Equal(pkp[:], d.GoogleG2PKP) {
-									defer conn.Close()
-									return nil, fmt.Errorf("Wrong certificate of %s: Issuer=%v, SubjectKeyId=%#v", conn.RemoteAddr(), cert.Subject, cert.SubjectKeyId)
+								if bytes.Equal(pkp[:], d.GoogleG2PKP) {
+									break
 								}
-							} else {
-								if !strings.HasPrefix(cert.Subject.CommonName, "Google ") {
-									defer conn.Close()
-									return nil, fmt.Errorf("Wrong certificate of %s: Issuer=%v, SubjectKeyId=%#v", conn.RemoteAddr(), cert.Subject, cert.SubjectKeyId)
+								fallthrough
+							case !strings.HasPrefix(cert.Subject.CommonName, "Google "):
+								err := fmt.Errorf("Wrong certificate of %s: Issuer=%v, SubjectKeyId=%#v", conn.RemoteAddr(), cert.Subject, cert.SubjectKeyId)
+								glog.Warningf("MultiDailer: %v", err)
+								if ip, _, err := net.SplitHostPort(conn.RemoteAddr().String()); err == nil {
+									d.IPBlackList.Set(ip, struct{}{}, time.Time{})
 								}
+								conn.Close()
+								return nil, err
 							}
 						}
 					}
@@ -171,38 +170,52 @@ func (d *MultiDialer) DialTLS2(network, address string, cfg *tls.Config) (net.Co
 		break
 	}
 
-	if dialer, ok := d.Dialer.(*net.Dialer); ok {
-		return tls.DialWithDialer(dialer, network, address, d.TLSConfig)
-	} else {
-		return tls.Dial(network, address, d.TLSConfig)
+	dialer := &net.Dialer{
+		KeepAlive: d.KeepAlive,
+		Timeout:   d.Timeout,
+		DualStack: d.DualStack,
 	}
+	return tls.DialWithDialer(dialer, network, address, d.TLSConfig)
 }
 
-func (d *MultiDialer) dialMultiTLS(network string, addrs []string, config *tls.Config) (net.Conn, error) {
-	glog.V(3).Infof("dialMultiTLS(%v, %v, %#v)", network, addrs, config)
+func (d *MultiDialer) dialMultiTLS(network string, hosts []string, port string, config *tls.Config) (net.Conn, error) {
+	glog.V(3).Infof("dialMultiTLS(%v, %v, %#v)", network, hosts, config)
 	type connWithError struct {
 		c net.Conn
 		e error
 	}
 
-	addrs = d.pickupTLSAddrs(addrs, d.Level)
-	lane := make(chan connWithError, len(addrs))
+	hosts = d.pickupTLSHosts(hosts, d.Level)
+	lane := make(chan connWithError, len(hosts))
 
-	for _, addr := range addrs {
-		go func(addr string, c chan<- connWithError) {
+	for _, host := range hosts {
+		go func(host string, c chan<- connWithError) {
 			// start := time.Now()
-			conn, err := d.Dialer.Dial(network, addr)
+			raddr, err := net.ResolveTCPAddr(network, net.JoinHostPort(host, port))
 			if err != nil {
-				d.TLSConnDuration.Del(addr)
-				d.TLSConnError.Set(addr, err, time.Now().Add(d.ConnExpiry))
-				lane <- connWithError{conn, err}
+				glog.Warningf("net.ResolveTCPAddr(%#v, %+v) err=%+v", network, host, err)
+				lane <- connWithError{nil, err}
 				return
 			}
 
+			ctx, cancel := context.WithTimeout(context.Background(), d.Timeout)
+			defer cancel()
+
+			conn, err := net.DialTCPContext(ctx, network, nil, raddr)
+			if err != nil {
+				d.TLSConnDuration.Del(host)
+				d.TLSConnError.Set(host, err, time.Now().Add(d.ErrorConnExpiry))
+				lane <- connWithError{nil, err}
+				return
+			}
+
+			if d.KeepAlive > 0 {
+				conn.SetKeepAlive(true)
+				conn.SetKeepAlivePeriod(d.KeepAlive)
+			}
+
 			if d.TLSConnReadBuffer > 0 {
-				if tc, ok := conn.(*net.TCPConn); ok {
-					tc.SetReadBuffer(d.TLSConnReadBuffer)
-				}
+				conn.SetReadBuffer(d.TLSConnReadBuffer)
 			}
 
 			if config == nil {
@@ -217,18 +230,18 @@ func (d *MultiDialer) dialMultiTLS(network string, addrs []string, config *tls.C
 
 			end := time.Now()
 			if err != nil {
-				d.TLSConnDuration.Del(addr)
-				d.TLSConnError.Set(addr, err, end.Add(d.ConnExpiry))
+				d.TLSConnDuration.Del(host)
+				d.TLSConnError.Set(host, err, end.Add(d.ErrorConnExpiry))
 			} else {
-				d.TLSConnDuration.Set(addr, end.Sub(start), end.Add(d.ConnExpiry))
+				d.TLSConnDuration.Set(host, end.Sub(start), end.Add(d.GoodConnExpiry))
 			}
 
 			lane <- connWithError{tlsConn, err}
-		}(addr, lane)
+		}(host, lane)
 	}
 
 	var r connWithError
-	for i := range addrs {
+	for i := range hosts {
 		r = <-lane
 		if r.e == nil {
 			go func(count int) {
@@ -239,67 +252,193 @@ func (d *MultiDialer) dialMultiTLS(network string, addrs []string, config *tls.C
 						r1.c.Close()
 					}
 				}
-			}(len(addrs) - 1 - i)
+			}(len(hosts) - 1 - i)
 			return r.c, nil
 		}
 	}
 	return nil, r.e
 }
 
-func (d *MultiDialer) pickupTLSAddrs(addrs []string, n int) []string {
-	if len(addrs) <= n {
-		return addrs
+func (d *MultiDialer) DialQuic(address string, tlsConfig *tls.Config, cfg *quic.Config) (quic.Session, error) {
+	if d.LogToStderr {
+		SetConsoleTextColorGreen()
+	}
+	glog.V(2).Infof("MULTIDIALER DialQuic(%#v) with good_addrs=%d, bad_addrs=%d", address, d.TLSConnDuration.Len(), d.TLSConnError.Len())
+	if d.LogToStderr {
+		SetConsoleTextColorReset()
+	}
+
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: !d.SSLVerify,
+			ServerName:         address,
+		}
+	}
+
+	if cfg == nil {
+		cfg = &quic.Config{
+			HandshakeTimeout:              d.Timeout,
+			IdleTimeout:                   d.Timeout,
+			RequestConnectionIDTruncation: true,
+			KeepAlive:                     true,
+		}
+	}
+
+	if host, port, err := net.SplitHostPort(address); err == nil {
+		if alias0, ok := d.SiteToAlias.Lookup(host); ok {
+			alias := alias0.(string)
+			if hosts, err := d.LookupAlias(alias); err == nil {
+				var config *quic.Config
+
+				isGoogleAddr := false
+				switch {
+				case strings.HasPrefix(alias, "google_"):
+					config = &quic.Config{
+						HandshakeTimeout:              d.Timeout,
+						IdleTimeout:                   d.Timeout,
+						RequestConnectionIDTruncation: true,
+						KeepAlive:                     true,
+					}
+					isGoogleAddr = true
+				case cfg == nil:
+					config = &quic.Config{
+						HandshakeTimeout:              d.Timeout,
+						IdleTimeout:                   d.Timeout,
+						RequestConnectionIDTruncation: true,
+						KeepAlive:                     true,
+					}
+				default:
+					config = cfg
+				}
+				glog.V(3).Infof("DialQuic(%#v) alais=%#v set quic.Config=%#v", address, alias, config)
+
+				sess, err := d.dialMultiQuic(hosts, port, tlsConfig, config)
+				if err != nil {
+					return nil, err
+				}
+				if d.SSLVerify && isGoogleAddr {
+					// TODO: verify google certificates
+				}
+				return sess, nil
+			}
+		}
+	}
+
+	return quic.DialAddr(address, tlsConfig, cfg)
+}
+
+func (d *MultiDialer) dialMultiQuic(hosts []string, port string, tlsConfig *tls.Config, config *quic.Config) (quic.Session, error) {
+	glog.V(3).Infof("dialMultiQuic( %v, %#v)", hosts, config)
+	type sessWithError struct {
+		s quic.Session
+		e error
+	}
+
+	hosts = d.pickupTLSHosts(hosts, d.Level)
+	lane := make(chan sessWithError, len(hosts))
+
+	for _, host := range hosts {
+		go func(host string, c chan<- sessWithError) {
+			addr := net.JoinHostPort(host, port)
+
+			start := time.Now()
+			sess, err := quic.DialAddr(addr, tlsConfig, config)
+			end := time.Now()
+
+			if err != nil {
+				d.TLSConnDuration.Del(host)
+				d.TLSConnError.Set(host, err, end.Add(d.ErrorConnExpiry))
+			} else {
+				d.TLSConnDuration.Set(host, end.Sub(start), end.Add(d.GoodConnExpiry))
+			}
+
+			lane <- sessWithError{sess, err}
+		}(host, lane)
+	}
+
+	var r sessWithError
+	for i := range hosts {
+		r = <-lane
+		if r.e == nil {
+			go func(count int) {
+				var r1 sessWithError
+				for ; count > 0; count-- {
+					r1 = <-lane
+					if r1.s != nil {
+						r1.s.Close(nil)
+					}
+				}
+			}(len(hosts) - 1 - i)
+			return r.s, nil
+		}
+	}
+	return nil, r.e
+}
+
+func (d *MultiDialer) pickupTLSHosts(hosts []string, n int) []string {
+	if len(hosts) <= n {
+		return hosts
 	}
 
 	type racer struct {
-		addr     string
+		host     string
 		duration time.Duration
 	}
 
-	goodAddrs := make([]racer, 0)
-	unknownAddrs := make([]string, 0)
-	badAddrs := make([]string, 0)
+	goods := make([]racer, 0)
+	unknowns := make([]string, 0)
+	bads := make([]string, 0)
 
-	for _, addr := range addrs {
-		if duration, ok := d.TLSConnDuration.Get(addr); ok {
+	for _, host := range hosts {
+		if duration, ok := d.TLSConnDuration.GetNotStale(host); ok {
 			if d, ok := duration.(time.Duration); !ok {
-				glog.Errorf("%#v for %#v is not a time.Duration", duration, addr)
+				glog.Errorf("%#v for %#v is not a time.Duration", duration, host)
 			} else {
-				goodAddrs = append(goodAddrs, racer{addr, d})
+				goods = append(goods, racer{host, d})
 			}
-		} else if e, ok := d.TLSConnError.Get(addr); ok {
+		} else if e, ok := d.TLSConnError.GetNotStale(host); ok {
 			if _, ok := e.(error); !ok {
-				glog.Errorf("%#v for %#v is not a error", e, addr)
+				glog.Errorf("%#v for %#v is not a error", e, host)
 			} else {
-				badAddrs = append(badAddrs, addr)
+				bads = append(bads, host)
 			}
 		} else {
-			unknownAddrs = append(unknownAddrs, addr)
+			unknowns = append(unknowns, host)
 		}
 	}
 
-	addrs1 := make([]string, 0, n)
+	sort.Slice(goods, func(i, j int) bool { return goods[i].duration < goods[j].duration })
 
-	sort.Slice(goodAddrs, func(i, j int) bool { return goodAddrs[i].duration < goodAddrs[j].duration })
-	if len(goodAddrs) > n/2 {
-		goodAddrs = goodAddrs[:n/2]
+	m := n / 2
+	if len(bads) > 16*len(goods) {
+		n += m
 	}
-	for _, r := range goodAddrs {
-		addrs1 = append(addrs1, r.addr)
+	if len(goods) > m {
+		goods = goods[:m]
 	}
 
-	for _, addrs2 := range [][]string{unknownAddrs, badAddrs} {
-		if len(addrs1) < n && len(addrs2) > 0 {
-			m := n - len(addrs1)
-			if len(addrs2) > m {
-				ShuffleStringsN(addrs2, m)
-				addrs2 = addrs2[:m]
+	hosts1 := make([]string, 0, n)
+	for _, r := range goods {
+		hosts1 = append(hosts1, r.host)
+	}
+
+	if len(goods) == 0 {
+		ShuffleStrings(unknowns)
+		ShuffleStrings(bads)
+	}
+
+	for _, hosts2 := range [][]string{unknowns, bads} {
+		if len(hosts1) < n && len(hosts2) > 0 {
+			m := n - len(hosts1)
+			if len(hosts2) > m {
+				ShuffleStringsN(hosts2, m)
+				hosts2 = hosts2[:m]
 			}
-			addrs1 = append(addrs1, addrs2...)
+			hosts1 = append(hosts1, hosts2...)
 		}
 	}
 
-	return addrs1
+	return hosts1
 }
 
 type MultiResolver struct {

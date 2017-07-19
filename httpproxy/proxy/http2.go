@@ -7,6 +7,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -14,19 +15,12 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"sync"
+	"time"
+
+	"github.com/cloudflare/golibs/lrucache"
 )
 
-var (
-	CRLF     = []byte{0x0d, 0x0a}
-	CRLFCRLF = []byte{0x0d, 0x0a, 0x0d, 0x0a}
-)
-
-var bufPool = sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
-}
-
-func HTTP1(network, addr string, auth *Auth, forward Dialer, resolver Resolver) (Dialer, error) {
+func HTTP2(network, addr string, auth *Auth, forward Dialer, resolver Resolver) (Dialer, error) {
 	var hostname string
 
 	if host, _, err := net.SplitHostPort(addr); err == nil {
@@ -36,12 +30,13 @@ func HTTP1(network, addr string, auth *Auth, forward Dialer, resolver Resolver) 
 		addr = net.JoinHostPort(addr, "443")
 	}
 
-	s := &http1{
+	s := &http2{
 		network:  network,
 		addr:     addr,
 		hostname: hostname,
 		forward:  forward,
 		resolver: resolver,
+		cache:    lrucache.NewLRUCache(128),
 	}
 	if auth != nil {
 		s.user = auth.User
@@ -51,51 +46,57 @@ func HTTP1(network, addr string, auth *Auth, forward Dialer, resolver Resolver) 
 	return s, nil
 }
 
-type http1 struct {
+type http2 struct {
 	user, password string
 	network, addr  string
 	hostname       string
 	forward        Dialer
 	resolver       Resolver
+	cache          lrucache.Cache
 }
 
-type preReaderConn struct {
-	net.Conn
-	data []byte
-}
-
-func (r *preReaderConn) Read(b []byte) (int, error) {
-	if r.data == nil {
-		return r.Conn.Read(b)
-	} else {
-		n := copy(b, r.data)
-		if n < len(r.data) {
-			r.data = r.data[n:]
-		} else {
-			r.data = nil
-		}
-		return n, nil
-	}
-}
-
-// Dial connects to the address addr on the network net via the HTTP1 proxy.
-func (h *http1) Dial(network, addr string) (net.Conn, error) {
+// Dial connects to the address addr on the network net via the HTTPS proxy.
+func (h *http2) Dial(network, addr string) (net.Conn, error) {
 	switch network {
 	case "tcp", "tcp6", "tcp4":
 	default:
 		return nil, errors.New("proxy: no support for HTTP proxy connections of type " + network)
 	}
 
-	conn, err := h.forward.Dial(h.network, h.addr)
+	conn0, err := h.forward.Dial(h.network, h.addr)
 	if err != nil {
 		return nil, err
 	}
-	closeConn := &conn
+	closeConn0 := &conn0
 	defer func() {
-		if closeConn != nil {
-			(*closeConn).Close()
+		if closeConn0 != nil {
+			(*closeConn0).Close()
 		}
 	}()
+
+	var config *tls.Config
+	if v, ok := h.cache.GetNotStale(h.addr); ok {
+		config = v.(*tls.Config)
+	} else {
+		config = &tls.Config{
+			MinVersion:         tls.VersionTLS10,
+			MaxVersion:         tls.VersionTLS13,
+			Max0RTTDataSize:    100 * 1024,
+			InsecureSkipVerify: true,
+			ServerName:         h.hostname,
+			ClientSessionCache: tls.NewLRUClientSessionCache(1024),
+		}
+		h.cache.Set(h.addr, config, time.Now().Add(2*time.Hour))
+	}
+
+	conn1 := tls.Client(conn0, config)
+
+	err = conn1.Handshake()
+	if err != nil {
+		return nil, err
+	}
+
+	var conn net.Conn = conn1
 
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -161,6 +162,6 @@ func (h *http1) Dial(network, addr string) (net.Conn, error) {
 		return nil, errors.New("proxy: failed to read greeting from HTTP proxy at " + h.addr + ": " + resp.Status)
 	}
 
-	closeConn = nil
+	closeConn0 = nil
 	return conn, nil
 }

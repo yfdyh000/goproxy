@@ -29,7 +29,13 @@ type Store interface {
 // Lookup config uri by filename
 func LookupStoreByFilterName(name string) Store {
 	var store Store
-	for _, dirname := range []string{filepath.Dir(os.Args[0]), ".", "httpproxy", "httpproxy/filters/" + name} {
+
+	exe, err := os.Executable()
+	if err != nil {
+		println("os.Executable() error: ", err)
+	}
+
+	for _, dirname := range []string{filepath.Dir(exe), ".", "httpproxy", "httpproxy/filters/" + name} {
 		filename := dirname + "/" + name + ".json"
 		if _, err := os.Stat(filename); err == nil {
 			store = &FileStore{dirname}
@@ -42,7 +48,6 @@ func LookupStoreByFilterName(name string) Store {
 	return store
 }
 
-func NotExist(store Store, name string) bool {
-	resp, err := store.Head(name)
+func IsNotExist(resp *http.Response, err error) bool {
 	return os.IsNotExist(err) || (resp != nil && resp.StatusCode == http.StatusNotFound)
 }

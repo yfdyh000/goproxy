@@ -10,7 +10,7 @@ import platform
 
 if platform.mac_ver()[0] > '10.':
     sys.exit(os.system(
-        'osascript -e \'display dialog "Please click goproxy-macos.command" buttons {"OK"} default button 1 with icon caution with title "GoProxy GTK"\''))
+        'osascript -e \'display dialog "Please use goproxy-macos rather than goproxy-gtk" buttons {"OK"} default button 1 with icon caution with title "GoProxy GTK"\''))
 
 try:
     import pygtk
@@ -52,10 +52,10 @@ def spawn_later(seconds, target, *args, **kwargs):
 def rewrite_desktop(filename):
     with open(filename, 'rb') as fp:
         content = fp.read()
-    if 'goproxy-gtk.png' not in content:
+    with open(filename, 'wb') as fp:
+        content = re.sub(r'(?m)Exec=.*', '''Exec=bash -c "export PATH=$PATH:`dirname '%%k'`:%s; exec goproxy-gtk.py"''' % os.getcwd(), content)
         content = re.sub(r'Icon=\S*', 'Icon=%s/goproxy-gtk.png' % os.getcwd(), content)
-        with open(filename, 'wb') as fp:
-            fp.write(content)
+        fp.write(content)
 
 #gtk.main_quit = lambda: None
 #appindicator = None
@@ -70,10 +70,14 @@ class GoProxyGTK:
 
     def __init__(self, window, terminal):
         self.window = window
-        self.window.set_size_request(652, 447)
+        self.terminal = terminal
+
+        self.window.set_size_request(640, 480)
         self.window.set_position(gtk.WIN_POS_CENTER)
         self.window.connect('delete-event', self.delete_event)
-        self.terminal = terminal
+        colormap = self.window.get_screen().get_rgba_colormap()
+        if colormap:
+            gtk.widget_set_default_colormap(colormap)
 
         self.window.add(terminal)
         self.childpid = self.terminal.fork_command(
@@ -148,6 +152,7 @@ class GoProxyGTK:
 
     def on_child_exited(self, term):
         if self.terminal.get_child_exit_status() == 0:
+            gtk.widget_pop_colormap()
             gtk.main_quit()
         else:
             self.show_notify(self.fail_message)
@@ -199,9 +204,7 @@ def main():
     if os.path.isfile('goproxy-gtk.desktop'):
         rewrite_desktop('goproxy-gtk.desktop')
 
-    window = gtk.Window()
-    terminal = vte.Terminal()
-    GoProxyGTK(window, terminal)
+    GoProxyGTK(gtk.Window(), vte.Terminal())
     gtk.main()
 
 if __name__ == '__main__':

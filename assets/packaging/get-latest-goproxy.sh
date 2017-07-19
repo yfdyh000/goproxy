@@ -1,18 +1,25 @@
-#!/bin/bash
+#!/bin/sh
+
+export LATEST=${LATEST:-false}
 
 set -e
 
-cd $(python -c "import os; print(os.path.dirname(os.path.realpath('$0')))")
+for CMD in curl sed expr tar;
+do
+		if ! command -v ${CMD} >/dev/null; then
+				echo "${CMD} is not installed, abort."
+				exit 1
+		fi
+done
+
+linkpath=$(ls -l "$0" | sed "s/.*->\s*//")
+cd "$(dirname "$0")" && test -f "$linkpath" && cd "$(dirname "$linkpath")" || true
 
 if [ -f "httpproxy.json" ]; then
 	if ! ls *.user.json ; then
 		echo "Please backup your config as .user.json"
 		exit 1
 	fi
-fi
-
-if [ -d cache ]; then
-	find cache -name "*.crt" -mtime +90 -delete
 fi
 
 FILENAME_PREFIX=
@@ -23,17 +30,29 @@ case $(uname -s)/$(uname -m) in
 	Linux/i686|Linux/i386 )
 		FILENAME_PREFIX=goproxy_linux_386
 		;;
-	Linux/armv7l|Linux/armv8 )
+	Linux/aarch64|Linux/arm64 )
 		FILENAME_PREFIX=goproxy_linux_arm64
 		;;
 	Linux/arm* )
 		FILENAME_PREFIX=goproxy_linux_arm
+		if grep -q ld-linux-armhf.so ./goproxy; then
+			FILENAME_PREFIX=goproxy_linux_arm_cgo
+		fi
 		;;
 	Linux/mips64el )
 		FILENAME_PREFIX=goproxy_linux_mips64le
 		;;
 	Linux/mips64 )
 		FILENAME_PREFIX=goproxy_linux_mips64
+		;;
+	Linux/mipsel )
+		FILENAME_PREFIX=goproxy_linux_mipsle
+		;;
+	Linux/mips )
+		FILENAME_PREFIX=goproxy_linux_mips
+		if hexdump -s 5 -n 1 $SHELL | grep -q 0001; then
+			FILENAME_PREFIX=goproxy_linux_mipsle
+		fi
 		;;
 	FreeBSD/x86_64 )
 		FILENAME_PREFIX=goproxy_freebsd_amd64
@@ -53,11 +72,20 @@ case $(uname -s)/$(uname -m) in
 		;;
 esac
 
+if ./goproxy -version >/dev/null 2>&1; then
+	GOPROXY_OS=$(./goproxy -os)
+	GOPROXY_ARCH=$(./goproxy -arch)
+	if test "${GOPROXY_OS}" = "darwin"; then
+		GOPROXY_OS=macos
+	fi
+	FILENAME_PREFIX=goproxy_${GOPROXY_OS}_${GOPROXY_ARCH}
+fi
+
 LOCALVERSION=$(./goproxy -version 2>/dev/null || :)
 echo "0. Local Goproxy version ${LOCALVERSION}"
 
-if [ "${http_proxy}" == "" ]; then
-	if netstat -an | grep -i tcp | grep LISTEN | grep ':8087'; then
+if test "${http_proxy}" = ""; then
+	if netstat -an | grep -i tcp | grep LISTEN | grep '[:\.]8087'; then
 		echo "Set http_proxy=http://127.0.0.1:8087"
 		export http_proxy=http://127.0.0.1:8087
 		export https_proxy=http://127.0.0.1:8087
@@ -69,20 +97,24 @@ for USER_JSON_FILE in *.user.json; do
 	if echo "${USER_JSON_LINE}" | grep -q AUTO_UPDATE_URL; then
 		USER_JSON_URL=${USER_JSON_LINE#* }
 		echo "Update ${USER_JSON_FILE} with ${USER_JSON_URL}"
-		curl -k "${USER_JSON_URL}" >${USER_JSON_FILE}.tmp
+		curl -fk "${USER_JSON_URL}" >${USER_JSON_FILE}.tmp
 		mv ${USER_JSON_FILE}.tmp ${USER_JSON_FILE}
 	fi
 done
 
 echo "1. Checking GoProxy Version"
-FILENAME=$(curl -kL https://github.com/phuslu/goproxy/releases/latest | grep -oE "<strong>${FILENAME_PREFIX}-r[0-9]+.+</strong>" | awk -F '<strong>|</strong>' '{print $2}')
+if test "${LATEST}" = "false"; then
+	FILENAME=$(curl -k https://github.com/phuslu/goproxy-ci/commits/master | grep -oE "${FILENAME_PREFIX}-r[0-9]+.[0-9a-z\.]+" | head -1)
+else
+	FILENAME=$(curl -kL https://github.com/phuslu/goproxy-ci/releases/latest | grep -oE "${FILENAME_PREFIX}-r[0-9]+.[0-9a-z\.]+" | head -1)
+fi
 REMOTEVERSION=$(echo ${FILENAME} | awk -F'.' '{print $1}' | awk -F'-' '{print $2}')
 if test -z "${REMOTEVERSION}"; then
 	echo "Cannot detect ${FILENAME_PREFIX} version"
 	exit 1
 fi
 
-if [[ ${LOCALVERSION#r*} -ge ${REMOTEVERSION#r*} ]]; then
+if expr "${LOCALVERSION#r*}" ">=" "${REMOTEVERSION#r*}" >/dev/null; then
 	echo "Your GoProxy already update to latest"
 	exit 1
 fi
@@ -108,7 +140,16 @@ case ${FILENAME##*.} in
 		exit 1
 esac
 
-tar -xvpf ${FILENAME%.*} --strip-components $(tar -tf ${FILENAME%.*} | head -1 | grep -c '/')
+DIRNAME=$(tar -tf ${FILENAME%.*} | grep '/$' | head -1)
+if test -n "${DIRNAME}"; then
+	rm -rf tmp
+	mkdir tmp
+	tar -xvpf ${FILENAME%.*} -C tmp
+	mv -f tmp/${DIRNAME}/* .
+	rm -rf tmp
+else
+	tar -xvpf ${FILENAME%.*}
+fi
 rm -f ${FILENAME%.*}
 
 echo "4. Done"

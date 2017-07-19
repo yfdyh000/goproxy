@@ -1,9 +1,9 @@
 {
+	"TLSVersion": "TLSv1.2",
 	"RootCA": {
 		"Name": "GoProxy",
 		"Dirname": "cache",
-		"Duration": 31536000,
-		"RSABits": 2048,
+		"Duration": 94608000,
 		"Portable": true,
 	},
 	"Ports": [

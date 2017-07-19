@@ -1,4 +1,4 @@
-{
+﻿{
 	"SiteFilters": {
 		"Enabled": false,
 		"Rules": {
@@ -14,17 +14,20 @@
 	},
 	"RegionFilters": {
 		"Enabled": false,
-		"DataFile": "GeoLite2-Country.mmdb",
-		"DNSServer": "",
+		"DataFile": "17monipdb.dat",
+		"EnableRemoteDNS": false,
+		"DNSServer": "114.114.114.114",
 		"DNSCacheSize": 4096,
 		"Rules": {
 			"default": "",
-			"private": "direct",
-			"CN": "direct",
+			"中国": "direct",
+			"局域网": "direct",
+			"保留地址": "direct",
 		},
 	},
 	"IndexFiles": {
 		"Enabled": true,
+		"SeverName": "",
 		"Files": [
 			"proxy.pac",
 			"GoProxyAPN.mobileconfig",

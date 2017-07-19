@@ -27,14 +27,6 @@ func ReflectRemoteIPFromResponse(resp *http.Response) (net.IP, error) {
 }
 
 func ReflectRemoteAddrFromResponse(resp *http.Response) (string, error) {
-	// if v := reflect.ValueOf(resp).Elem().FieldByName("RemoteAddr"); v.IsValid() {
-	// 	return v.String(), nil
-	// }
-	return reflectRemoteAddrFromResponse(resp)
-}
-
-func reflectRemoteAddrFromResponse(resp *http.Response) (string, error) {
-
 	if resp.Body == nil {
 		return "", fmt.Errorf("ReflectRemoteAddrFromResponse: cannot reflect %#v for %v", resp, resp.Request.URL.String())
 	}

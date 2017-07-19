@@ -5,25 +5,31 @@ setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
 
-echo. >~.txt
-echo Set Http = CreateObject("WinHttp.WinHttpRequest.5.1") >>~.txt
-echo Set Stream = CreateObject("Adodb.Stream") >>~.txt
-echo Http.SetTimeouts 30*1000, 30*1000, 30*1000, 120*1000  >>~.txt
-netstat -an| findstr LISTENING | findstr ":8087" >NUL && (
-    echo Http.SetProxy 2, "127.0.0.1:8087", "" >>~.txt
-)
-echo Http.Open "GET", WScript.Arguments.Item(0), False >>~.txt
-echo Http.Send >>~.txt
-echo Http.WaitForResponse 5 >>~.txt
-echo If Not Http.Status = 200 then >>~.txt
-echo     WScript.Quit 1 >>~.txt
-echo End If >>~.txt
-echo Stream.Type = 1 >>~.txt
-echo Stream.Open >>~.txt
-echo Stream.Write Http.ResponseBody >>~.txt
-echo Stream.SaveToFile WScript.Arguments.Item(1), 2 >>~.txt
+(
+echo Set Http = CreateObject^("WinHttp.WinHttpRequest.5.1"^)
+echo Set Stream = CreateObject^("Adodb.Stream"^)
+echo Set Environment = CreateObject^("WScript.Shell"^).Environment^("Process"^)
+echo If Not Environment^("HTTP_PROXY"^) = "" then
+echo     Http.SetProxy 2, Environment^("HTTP_PROXY"^), ""
+echo     Http.Option^(4^) = 256
+echo End If
+echo Http.SetTimeouts 30*1000, 30*1000, 30*1000, 120*1000
+echo Http.Open "GET", WScript.Arguments.Item^(0^), False
+echo Http.Send
+echo Http.WaitForResponse 5
+echo If Not Http.Status = 200 then
+echo     WScript.Quit 1
+echo End If
+echo Stream.Type = 1
+echo Stream.Open
+echo Stream.Write Http.ResponseBody
+echo Stream.SaveToFile WScript.Arguments.Item^(1^), 2
+)>~.txt
 move /y ~.txt ~gdownload.vbs >NUL
 
+netstat -an| findstr LISTENING | findstr ":8087" >NUL && (
+    set HTTP_PROXY=127.0.0.1:8087
+)
 
 set has_user_json=0
 if exist "httpproxy.json" (
@@ -50,11 +56,9 @@ for %%I in (*.user.json) do (
     )
 )
 
-set filename_prefix=goproxy_windows_386
-if "%PROCESSOR_ARCHITECTURE%" == "AMD64" (
-    set filename_prefix=goproxy_windows_amd64
-)
-if exist "%SystemDrive%\Program Files (x86)" (
+reg query "HKLM\Hardware\Description\System\CentralProcessor\0" | find /i "x86" && (
+    set filename_prefix=goproxy_windows_386
+) || (
     set filename_prefix=goproxy_windows_amd64
 )
 
@@ -66,16 +70,16 @@ if exist "goproxy.exe" (
     )
 )
 if not "%localversion%" == "" (
-    echo 0. Local Goproxy version %localversion%
+    echo 0. Local GoProxy version %localversion%
 )
 
 set remoteversion=
 (
     title 1. Checking GoProxy Version
     echo 1. Checking GoProxy Version
-    cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy/releases/latest ~goproxy_tag.txt
+    cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy-ci/commits/master ~goproxy_tag.txt
 ) && (
-    for /f "usebackq tokens=4 delims=<>-." %%I in (`findstr "<strong>%filename_prefix%-r" ~goproxy_tag.txt`) do (
+    for /f "usebackq tokens=2 delims=-." %%I in (`findstr "%filename_prefix%-r" ~goproxy_tag.txt`) do (
         set remoteversion=%%I
     )
 ) || (
@@ -99,36 +103,26 @@ if "!localversion!" neq "r9999" (
 set filename=!filename_prefix!-!remoteversion!.7z
 
 (
-    title 2. Downloading 7zCon.sfx for extracting
-    echo 2. Downloading 7zCon.sfx for extracting
-    cscript /nologo ~gdownload.vbs https://raw.githubusercontent.com/phuslu/goproxy/master/assets/download/7zCon.sfx ~7zCon.sfx
-    if not exist "~7zCon.sfx" (
-        echo Cannot download 7zCon.sfx
-        goto quit
-    )
-) && (
-    title 3. Downloading %filename%
-    echo 3. Downloading %filename%
+    title 2. Downloading %filename%
+    echo 2. Downloading %filename%
     cscript /nologo ~gdownload.vbs https://github.com/phuslu/goproxy-ci/releases/download/!remoteversion!/%filename% "~%filename%"
     if not exist "~%filename%" (
         echo Cannot download %filename%
         goto quit
     )
 ) && (
-    title 4. Extract Goproxy files
-    echo 4. Extract Goproxy files
-    copy /b ~7zCon.sfx+~%filename% ~%filename%.exe
-    del /f ~gdownload.vbs ~7zCon.sfx ~%filename% 2>NUL
+    title 3. Extract GoProxy files
+    echo 3. Extract GoProxy files
+    move /y ~%filename% ~%filename%.exe
+    del /f ~gdownload.vbs 2>NUL
     for %%I in ("goproxy.exe" "goproxy-gui.exe") do (
         if exist "%%~I" (
             move /y "%%~I" "~%%~nI.%localversion%.%%~xI.tmp"
         )
     )
-    ~%filename%.exe -y
-    title 5. Update %filename% OK
-    echo 5. Update %filename% OK
+    ~%filename%.exe -y || echo "Failed to update GoProxy, please retry."
 )
 
 :quit
     del /f ~* 1>NUL 2>NUL
-    pause >NUL
+    pause

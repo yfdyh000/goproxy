@@ -2,12 +2,15 @@ package stripssl
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io/ioutil"
 	"math/big"
 	"net"
@@ -25,12 +28,15 @@ import (
 	"../../storage"
 )
 
+const (
+	rsaBits int = 2048
+)
+
 type RootCA struct {
 	store    storage.Store
 	name     string
 	keyFile  string
 	certFile string
-	rsaBits  int
 	certDir  string
 	mu       *sync.Mutex
 
@@ -39,13 +45,17 @@ type RootCA struct {
 	derBytes []byte
 }
 
-func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string, portable bool) (*RootCA, error) {
+func NewRootCA(name string, vaildFor time.Duration, certDir string, portable bool) (*RootCA, error) {
 	keyFile := name + ".key"
 	certFile := name + ".crt"
 
 	var store storage.Store
 	if portable {
-		store = &storage.FileStore{filepath.Dir(os.Args[0])}
+		exe, err := os.Executable()
+		if err != nil {
+			glog.Fatalf("os.Executable() error: %+v", err)
+		}
+		store = &storage.FileStore{filepath.Dir(exe)}
 	} else {
 		store = &storage.FileStore{"."}
 	}
@@ -55,12 +65,11 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string,
 		name:     name,
 		keyFile:  keyFile,
 		certFile: certFile,
-		rsaBits:  rsaBits,
 		certDir:  certDir,
 		mu:       new(sync.Mutex),
 	}
 
-	if storage.NotExist(store, certFile) {
+	if storage.IsNotExist(store.Head(certFile)) {
 		glog.Infof("Generating RootCA for %s/%s", keyFile, certFile)
 		template := x509.Certificate{
 			IsCA:         true,
@@ -78,6 +87,8 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string,
 					},
 				},
 			},
+			DNSNames: []string{name},
+
 			NotBefore: time.Now().Add(-time.Duration(30 * 24 * time.Hour)),
 			NotAfter:  time.Now().Add(vaildFor),
 
@@ -151,6 +162,8 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string,
 						return nil, err
 					}
 					rootCA.priv = priv
+				case "EC PRIVATE KEY":
+					return nil, fmt.Errorf("unsupported %#v certificate, name=%#v", b.Type, name)
 				}
 			}
 		}
@@ -180,8 +193,8 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string,
 	}
 
 	if fs, ok := store.(*storage.FileStore); ok {
-		if storage.NotExist(store, certDir) {
-			if err := os.Mkdir(filepath.Join(fs.Dirname, certDir), 0777); err != nil {
+		if storage.IsNotExist(store.Head(certDir)) {
+			if err := os.MkdirAll(filepath.Join(fs.Dirname, certDir), 0777); err != nil {
 				return nil, err
 			}
 		}
@@ -190,8 +203,8 @@ func NewRootCA(name string, vaildFor time.Duration, rsaBits int, certDir string,
 	return rootCA, nil
 }
 
-func (c *RootCA) issue(commonName string, vaildFor time.Duration, rsaBits int) error {
-	certFile := c.toFilename(commonName, ".crt")
+func (c *RootCA) issueECC(commonName string, vaildFor time.Duration) error {
+	certFile := c.toFilename(commonName, true)
 
 	csrTemplate := &x509.CertificateRequest{
 		Signature: []byte(commonName),
@@ -201,6 +214,72 @@ func (c *RootCA) issue(commonName string, vaildFor time.Duration, rsaBits int) e
 			OrganizationalUnit: []string{c.name},
 			CommonName:         commonName,
 		},
+		DNSNames: []string{commonName},
+	}
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader, csrTemplate, priv)
+	if err != nil {
+		return err
+	}
+
+	csr, err := x509.ParseCertificateRequest(csrBytes)
+	if err != nil {
+		return err
+	}
+
+	certTemplate := &x509.Certificate{
+		Subject:            csr.Subject,
+		DNSNames:           []string{commonName},
+		PublicKeyAlgorithm: csr.PublicKeyAlgorithm,
+		PublicKey:          csr.PublicKey,
+		SerialNumber:       big.NewInt(time.Now().UnixNano()),
+		NotBefore:          time.Now().Add(-time.Duration(30 * 24 * time.Hour)),
+		NotAfter:           time.Now().Add(vaildFor),
+		KeyUsage:           x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageServerAuth,
+			x509.ExtKeyUsageClientAuth,
+		},
+	}
+
+	certBytes, err := x509.CreateCertificate(rand.Reader, certTemplate, c.ca, csr.PublicKey, c.priv)
+	if err != nil {
+		return err
+	}
+
+	b := new(bytes.Buffer)
+	pem.Encode(b, &pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+
+	b1, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	pem.Encode(b, &pem.Block{Type: "EC PRIVATE KEY", Bytes: b1})
+
+	if _, err = c.store.Put(certFile, http.Header{}, ioutil.NopCloser(b)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *RootCA) issueRSA(commonName string, vaildFor time.Duration) error {
+	certFile := c.toFilename(commonName, false)
+
+	csrTemplate := &x509.CertificateRequest{
+		Signature: []byte(commonName),
+		Subject: pkix.Name{
+			Country:            []string{"CN"},
+			Organization:       []string{commonName},
+			OrganizationalUnit: []string{c.name},
+			CommonName:         commonName,
+		},
+		DNSNames:           []string{commonName},
 		SignatureAlgorithm: x509.SHA256WithRSA,
 	}
 
@@ -221,6 +300,7 @@ func (c *RootCA) issue(commonName string, vaildFor time.Duration, rsaBits int) e
 
 	certTemplate := &x509.Certificate{
 		Subject:            csr.Subject,
+		DNSNames:           []string{commonName},
 		PublicKeyAlgorithm: csr.PublicKeyAlgorithm,
 		PublicKey:          csr.PublicKey,
 		SerialNumber:       big.NewInt(time.Now().UnixNano()),
@@ -276,37 +356,60 @@ func GetCommonName(domain string) string {
 	return domain
 }
 
-func (c *RootCA) RsaBits() int {
-	return c.rsaBits
-}
-
-func (c *RootCA) toFilename(commonName, suffix string) string {
+func (c *RootCA) toFilename(commonName string, ecc bool) string {
 	if strings.HasPrefix(commonName, "*.") {
 		commonName = commonName[1:]
 	}
-	return c.certDir + "/" + commonName + suffix
+
+	var sepDir string
+	if ecc {
+		sepDir = "/ecc/"
+	} else {
+		sepDir = "/rsa/"
+	}
+
+	return c.certDir + sepDir + commonName + ".crt"
 }
 
-func (c *RootCA) Issue(commonName string, vaildFor time.Duration, rsaBits int) (*tls.Certificate, error) {
-	certFile := c.toFilename(commonName, ".crt")
+func (c *RootCA) Issue(commonName string, vaildFor time.Duration, ecc bool) (*tls.Certificate, error) {
+	certFile := c.toFilename(commonName, ecc)
 
-	if storage.NotExist(c.store, certFile) {
+	resp, err := c.store.Get(certFile)
+	switch {
+	case err == nil && resp.StatusCode == http.StatusOK:
+		t, err := time.Parse(storage.DateFormat, resp.Header.Get("Last-Modified"))
+		if err == nil && time.Now().Sub(t) < 3*30*24*time.Hour {
+			break
+		}
+		resp.Body.Close()
+		c.store.Delete(certFile)
+		fallthrough
+	case storage.IsNotExist(resp, err):
 		glog.V(2).Infof("Issue %s certificate for %#v...", c.name, commonName)
 		c.mu.Lock()
-		defer c.mu.Unlock()
-		if storage.NotExist(c.store, certFile) {
-			if err := c.issue(commonName, vaildFor, rsaBits); err != nil {
+		if storage.IsNotExist(c.store.Head(certFile)) {
+			var err error
+
+			if ecc {
+				err = c.issueECC(commonName, vaildFor)
+			} else {
+				err = c.issueRSA(commonName, vaildFor)
+			}
+			if err != nil {
+				c.mu.Unlock()
 				return nil, err
 			}
 		}
-	}
-
-	resp, err := c.store.Get(certFile)
-	if err != nil {
+		c.mu.Unlock()
+		resp, err = c.store.Get(certFile)
+		if err != nil {
+			return nil, err
+		}
+	case err != nil:
 		return nil, err
 	}
-	defer resp.Body.Close()
 
+	defer resp.Body.Close()
 	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err

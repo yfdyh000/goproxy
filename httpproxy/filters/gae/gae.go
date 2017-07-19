@@ -1,13 +1,10 @@
 package gae
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"flag"
-	"io"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -18,6 +15,8 @@ import (
 	"github.com/cloudflare/golibs/lrucache"
 	"github.com/phuslu/glog"
 	"github.com/phuslu/net/http2"
+	quic "github.com/phuslu/quic-go"
+	"github.com/phuslu/quic-go/h2quic"
 
 	"../../filters"
 	"../../helpers"
@@ -37,6 +36,7 @@ type Config struct {
 	ForceIPv6       bool
 	DisableHTTP2    bool
 	ForceHTTP2      bool
+	EnableQuic      bool
 	EnableDeadProbe bool
 	EnableRemoteDNS bool
 	SiteToAlias     map[string]string
@@ -80,8 +80,8 @@ type Config struct {
 
 type Filter struct {
 	Config
-	GAETransport       *Transport
-	DirectTransport    http.RoundTripper
+	GAETransport       *GAETransport
+	Transport          *Transport
 	ForceHTTPSMatcher  *helpers.HostMatcher
 	ForceGAEStrings    []string
 	ForceGAESuffixs    []string
@@ -92,22 +92,15 @@ type Filter struct {
 }
 
 func init() {
-	filename := filterName + ".json"
-	config := new(Config)
-	err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
-	if err != nil {
-		glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
-	}
-
-	err = filters.Register(filterName, &filters.RegisteredFilter{
-		New: func() (filters.Filter, error) {
-			return NewFilter(config)
-		},
+	filters.Register(filterName, func() (filters.Filter, error) {
+		filename := filterName + ".json"
+		config := new(Config)
+		err := storage.LookupStoreByFilterName(filterName).UnmarshallJson(filename, config)
+		if err != nil {
+			glog.Fatalf("storage.ReadJsonConfig(%#v) failed: %s", filename, err)
+		}
+		return NewFilter(config)
 	})
-
-	if err != nil {
-		glog.Fatalf("Register(%#v) error: %s", filterName, err)
-	}
 }
 
 func NewFilter(config *Config) (filters.Filter, error) {
@@ -144,12 +137,10 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		},
 	}
 	switch config.TLSConfig.Version {
-	case "TLSv12", "TLSv1.2":
-		googleTLSConfig.MinVersion = tls.VersionTLS12
-	case "TLSv11", "TLSv1.1":
-		googleTLSConfig.MinVersion = tls.VersionTLS11
+	case "TLSv13", "TLSv1.3":
+		googleTLSConfig.MinVersion = tls.VersionTLS13
 	default:
-		googleTLSConfig.MinVersion = tls.VersionTLS10
+		googleTLSConfig.MinVersion = tls.VersionTLS12
 	}
 	pickupCiphers := func(names []string) []uint16 {
 		ciphers := make([]uint16, 0)
@@ -161,24 +152,6 @@ func NewFilter(config *Config) (filters.Filter, error) {
 			ciphers = append(ciphers, cipher)
 		}
 		helpers.ShuffleUint16s(ciphers)
-		ciphers = ciphers[:1+rand.Intn(len(ciphers))]
-		ciphers1 := []uint16{}
-		for _, name := range []string{
-			"TLS_RSA_WITH_AES_256_CBC_SHA256",
-			"TLS_RSA_WITH_AES_256_GCM_SHA384",
-			"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-			"TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-		} {
-			if !helpers.ContainsString(names, name) {
-				if c := helpers.Cipher(name); c != 0 {
-					ciphers1 = append(ciphers1, c)
-				}
-			}
-		}
-		helpers.ShuffleUint16s(ciphers1)
-		ciphers1 = ciphers1[:rand.Intn(len(ciphers1))]
-		ciphers = append(ciphers, ciphers1...)
-		helpers.ShuffleUint16s(ciphers)
 		return ciphers
 	}
 	googleTLSConfig.CipherSuites = pickupCiphers(config.TLSConfig.Ciphers)
@@ -186,7 +159,7 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		googleTLSConfig.ServerName = config.TLSConfig.ServerName[rand.Intn(len(config.TLSConfig.ServerName))]
 	}
 	if !config.DisableHTTP2 {
-		googleTLSConfig.NextProtos = []string{"h2", "h2-14", "http/1.1"}
+		googleTLSConfig.NextProtos = []string{"h2", "http/1.1"}
 	}
 
 	if config.Site2Alias == nil {
@@ -199,13 +172,9 @@ func NewFilter(config *Config) (filters.Filter, error) {
 
 	hostmap := map[string][]string{}
 	for key, value := range config.HostMap {
-		hostmap[key] = helpers.UniqueStrings(value)
-	}
-
-	d := &net.Dialer{
-		KeepAlive: time.Duration(config.Transport.Dialer.KeepAlive) * time.Second,
-		Timeout:   time.Duration(config.Transport.Dialer.Timeout) * time.Second,
-		DualStack: config.Transport.Dialer.DualStack,
+		hosts := helpers.UniqueStrings(value)
+		helpers.ShuffleStrings(hosts)
+		hostmap[key] = hosts
 	}
 
 	r := &helpers.Resolver{
@@ -223,7 +192,9 @@ func NewFilter(config *Config) (filters.Filter, error) {
 	}
 
 	md := &helpers.MultiDialer{
-		Dialer:            d,
+		KeepAlive:         time.Duration(config.Transport.Dialer.KeepAlive) * time.Second,
+		Timeout:           time.Duration(config.Transport.Dialer.Timeout) * time.Second,
+		DualStack:         config.Transport.Dialer.DualStack,
 		Resolver:          r,
 		SSLVerify:         config.SSLVerify,
 		LogToStderr:       flag.Lookup("logtostderr") != nil,
@@ -236,7 +207,8 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		TLSConnDuration:   lrucache.NewLRUCache(8192),
 		TLSConnError:      lrucache.NewLRUCache(8192),
 		TLSConnReadBuffer: config.Transport.Dialer.SocketReadBuffer,
-		ConnExpiry:        5 * time.Minute,
+		GoodConnExpiry:    5 * time.Minute,
+		ErrorConnExpiry:   30 * time.Minute,
 		Level:             config.Transport.Dialer.Level,
 	}
 
@@ -244,35 +216,53 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		md.IPBlackList.Set(ip, struct{}{}, time.Time{})
 	}
 
-	var tr http.RoundTripper
-
-	GetConnectMethodAddr := func(addr string) string {
-		if host, port, err := net.SplitHostPort(addr); err == nil {
-			if alias, ok := md.SiteToAlias.Lookup(host); ok {
-				addr = net.JoinHostPort(alias.(string), port)
-			}
+	GetHostnameCacheKey := func(addr string) string {
+		var host, port string
+		var err error
+		host, port, err = net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+			port = "443"
 		}
+
+		if alias, ok := md.SiteToAlias.Lookup(host); ok {
+			addr = net.JoinHostPort(alias.(string), port)
+		}
+
 		return addr
 	}
 
+	tr := &Transport{
+		MultiDialer: md,
+		RetryTimes:  2,
+	}
+
 	t1 := &http.Transport{
-		Dial:                  md.Dial,
 		DialTLS:               md.DialTLS,
 		DisableKeepAlives:     config.Transport.DisableKeepAlives,
 		DisableCompression:    config.Transport.DisableCompression,
 		ResponseHeaderTimeout: time.Duration(config.Transport.ResponseHeaderTimeout) * time.Second,
 		IdleConnTimeout:       time.Duration(config.Transport.IdleConnTimeout) * time.Second,
 		MaxIdleConnsPerHost:   config.Transport.MaxIdleConnsPerHost,
-		GetConnectMethodAddr:  GetConnectMethodAddr,
+		GetConnectMethodAddr:  GetHostnameCacheKey,
 	}
 
 	if config.Transport.Proxy.Enabled {
+		if config.EnableQuic {
+			glog.Fatalf("EnableQuic is conflict with Proxy setting!")
+		}
 		fixedURL, err := url.Parse(config.Transport.Proxy.URL)
 		if err != nil {
 			glog.Fatalf("url.Parse(%#v) error: %s", config.Transport.Proxy.URL, err)
 		}
 
-		dialer, err := proxy.FromURL(fixedURL, d, &helpers.MultiResolver{md})
+		dialer0 := &net.Dialer{
+			KeepAlive: md.KeepAlive,
+			Timeout:   md.Timeout,
+			DualStack: md.DualStack,
+		}
+
+		dialer, err := proxy.FromURL(fixedURL, dialer0, &helpers.MultiResolver{md})
 		if err != nil {
 			glog.Fatalf("proxy.FromURL(%#v) error: %s", fixedURL.String(), err)
 		}
@@ -284,12 +274,25 @@ func NewFilter(config *Config) (filters.Filter, error) {
 	}
 
 	switch {
+	case config.EnableQuic:
+		tr.RoundTripper = &h2quic.RoundTripper{
+			DisableCompression: true,
+			TLSClientConfig:    md.GoogleTLSConfig,
+			QuicConfig: &quic.Config{
+				HandshakeTimeout:              md.Timeout,
+				IdleTimeout:                   md.Timeout,
+				RequestConnectionIDTruncation: true,
+				KeepAlive:                     true,
+			},
+			DialAddr:     md.DialQuic,
+			GetClientKey: GetHostnameCacheKey,
+		}
 	case config.DisableHTTP2 && config.ForceHTTP2:
 		glog.Fatalf("GAE: DisableHTTP2=%v and ForceHTTP2=%v is conflict!", config.DisableHTTP2, config.ForceHTTP2)
 	case config.Transport.Proxy.Enabled && config.ForceHTTP2:
 		glog.Fatalf("GAE: Proxy.Enabled=%v and ForceHTTP2=%v is conflict!", config.Transport.Proxy.Enabled, config.ForceHTTP2)
 	case config.ForceHTTP2:
-		tr = &http2.Transport{
+		tr.RoundTripper = &http2.Transport{
 			DialTLS:            md.DialTLS2,
 			TLSClientConfig:    md.GoogleTLSConfig,
 			DisableCompression: config.Transport.DisableCompression,
@@ -299,9 +302,9 @@ func NewFilter(config *Config) (filters.Filter, error) {
 		if err != nil {
 			glog.Warningf("GAE: Error enabling Transport HTTP/2 support: %v", err)
 		}
-		tr = t1
+		tr.RoundTripper = t1
 	default:
-		tr = t1
+		tr.RoundTripper = t1
 	}
 
 	forceHTTPSMatcherStrings := make([]string, 0)
@@ -327,39 +330,76 @@ func NewFilter(config *Config) (filters.Filter, error) {
 	}
 
 	if config.EnableDeadProbe && !config.Transport.Proxy.Enabled {
-		go func() {
-			probe := func() {
-				req, _ := http.NewRequest(http.MethodGet, "https://clients3.google.com/generate_204", nil)
-				ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
-				defer cancel()
-				req = req.WithContext(ctx)
-				resp, err := tr.RoundTrip(req)
-				if resp != nil {
-					glog.V(3).Infof("GAE EnableDeadProbe \"%s %s\" %d -", req.Method, req.URL.String(), resp.StatusCode)
-					if resp.Body != nil {
-						io.Copy(ioutil.Discard, resp.Body)
-						resp.Body.Close()
-					}
-					if resp.StatusCode == http.StatusBadGateway {
-						if ip, err := helpers.ReflectRemoteIPFromResponse(resp); err == nil && ip != nil {
-							duration := 1 * time.Hour
-							glog.Warningf("GAE EnableDeadProbe: %s StatusCode is %d, not a gws/gvs ip, add to blacklist for %v", ip, resp.StatusCode, duration)
-							md.IPBlackList.Set(ip.String(), struct{}{}, time.Now().Add(duration))
-						}
-					}
-				}
-				if err != nil {
-					glog.V(2).Infof("GAE EnableDeadProbe \"%s %s\" error: %v", req.Method, req.URL.String(), err)
-					s := strings.ToLower(err.Error())
-					if strings.HasPrefix(s, "net/http: request canceled") || strings.Contains(s, "timeout") {
-						helpers.CloseConnections(tr)
-					}
-				}
+		isNetAvailable := func() bool {
+			c, err := net.DialTimeout("tcp", net.JoinHostPort(config.DNSServers[0], "53"), 300*time.Millisecond)
+			if err != nil {
+				glog.V(3).Infof("GAE EnableDeadProbe connect DNSServer(%#v) failed: %+v", config.DNSServers[0], err)
+				return false
+			}
+			c.Close()
+			return true
+		}
+
+		probeTLS := func() {
+			if !isNetAvailable() {
+				return
 			}
 
+			req, _ := http.NewRequest(http.MethodGet, "https://clients3.google.com/generate_204", nil)
+			ctx, cancel := context.WithTimeout(req.Context(), 2*time.Second)
+			defer cancel()
+			req = req.WithContext(ctx)
+			resp, err := tr.RoundTrip(req)
+			if err != nil {
+				glog.V(2).Infof("GAE EnableDeadProbe \"%s %s\" error: %v", req.Method, req.URL.String(), err)
+				s := strings.ToLower(err.Error())
+				if strings.HasPrefix(s, "net/http: request canceled") || strings.Contains(s, "timeout") {
+					helpers.CloseConnections(tr.RoundTripper)
+				}
+			}
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+		}
+
+		probeQuic := func() {
+			if !isNetAvailable() {
+				return
+			}
+
+			c := make(chan error)
+
+			go func(c chan<- error) {
+				req, _ := http.NewRequest(http.MethodGet, "https://clients3.google.com/generate_204", nil)
+				resp, err := tr.RoundTrip(req)
+				c <- err
+				if resp != nil && resp.Body != nil {
+					resp.Body.Close()
+				}
+			}(c)
+
+			select {
+			case err := <-c:
+				if ne, ok := err.(*net.OpError); ok && err != nil {
+					glog.V(2).Infof("GAE EnableDeadProbe probeQuic error: %v", ne)
+					helpers.CloseConnections(tr.RoundTripper)
+				}
+			case <-time.After(3 * time.Second):
+				glog.V(2).Infof("GAE EnableDeadProbe probeQuic timed out. Close all quic connections")
+				helpers.CloseConnections(tr.RoundTripper)
+			}
+
+		}
+
+		go func() {
+			time.Sleep(1 * time.Minute)
 			for {
-				time.Sleep(time.Duration(2+rand.Intn(5)) * time.Second)
-				probe()
+				time.Sleep(time.Duration(2+rand.Intn(4)) * time.Second)
+				if config.EnableQuic {
+					probeQuic()
+				} else {
+					probeTLS()
+				}
 			}
 		}()
 	}
@@ -368,15 +408,15 @@ func NewFilter(config *Config) (filters.Filter, error) {
 
 	f := &Filter{
 		Config: *config,
-		GAETransport: &Transport{
+		GAETransport: &GAETransport{
 			RoundTripper: tr,
 			MultiDialer:  md,
 			Servers:      NewServers(config.AppIDs, config.Password, config.SSLVerify),
 			Deadline:     time.Duration(config.Transport.ResponseHeaderTimeout-2) * time.Second,
-			RetryDelay:   time.Duration(config.Transport.RetryDelay*1000) * time.Second,
+			RetryDelay:   time.Duration(config.Transport.RetryDelay*1000) * time.Millisecond,
 			RetryTimes:   config.Transport.RetryTimes,
 		},
-		DirectTransport:    tr,
+		Transport:          tr,
 		ForceHTTPSMatcher:  helpers.NewHostMatcher(forceHTTPSMatcherStrings),
 		ForceGAEMatcher:    helpers.NewHostMatcher(forceGAEMatcherStrings),
 		ForceGAEStrings:    forceGAEStrings,
@@ -399,7 +439,7 @@ func (f *Filter) FilterName() string {
 func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Context, *http.Response, error) {
 	var tr http.RoundTripper = f.GAETransport
 
-	if req.URL.Scheme == "http" && f.ForceHTTPSMatcher.Match(req.Host) {
+	if req.URL.Scheme == "http" && f.ForceHTTPSMatcher.Match(req.Host) && req.URL.Path != "/ocsp" {
 		if !strings.HasPrefix(req.Header.Get("Referer"), "https://") {
 			u := strings.Replace(req.URL.String(), "http://", "https://", 1)
 			glog.V(2).Infof("GAE FORCEHTTPS get raw url=%v, redirect to %v", req.URL.String(), u)
@@ -454,7 +494,7 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 		}
 
 		if req.URL.Scheme != "http" && !f.shouldForceGAE(req) {
-			tr = f.DirectTransport
+			tr = f.Transport
 			if s := req.Header.Get("Connection"); s != "" {
 				if s1 := strings.ToLower(s); s != s1 {
 					req.Header.Set("Connection", s1)
@@ -463,7 +503,7 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 		}
 	}
 
-	if tr != f.DirectTransport && req.Method == http.MethodOptions {
+	if tr != f.Transport && req.Method == http.MethodOptions {
 		if v, ok := f.FakeOptionsMatcher.Lookup(req.Host); ok {
 			resp := &http.Response{
 				StatusCode:    http.StatusOK,
@@ -507,60 +547,17 @@ func (f *Filter) RoundTrip(ctx context.Context, req *http.Request) (context.Cont
 	}
 
 	prefix := "FETCH"
-	if tr == f.DirectTransport {
+	if tr == f.Transport {
 		prefix = "DIRECT"
 	}
 
 	resp, err := tr.RoundTrip(req)
 	if err != nil {
 		glog.Warningf("%s \"GAE %s %s %s %s\" error: %T(%v)", req.RemoteAddr, prefix, req.Method, req.URL.String(), req.Proto, err, err)
-		if tr == f.DirectTransport {
-			if ne, ok := err.(interface {
-				Timeout() bool
-			}); ok && ne.Timeout() {
-				// f.MultiDialer.ClearCache()
-				helpers.CloseConnections(tr)
-			}
-		}
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
 		}
 		return ctx, nil, err
-	}
-
-	if tr == f.DirectTransport && resp.StatusCode >= http.StatusBadRequest {
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			resp.Body.Close()
-			return ctx, nil, err
-		}
-		if addr, err := helpers.ReflectRemoteAddrFromResponse(resp); err == nil {
-			if ip, _, err := net.SplitHostPort(addr); err == nil {
-				var duration time.Duration
-				switch {
-				case resp.StatusCode == http.StatusBadGateway && bytes.Contains(body, []byte("Please try again in 30 seconds.")):
-					duration = 1 * time.Hour
-				case resp.StatusCode == http.StatusNotFound && bytes.Contains(body, []byte("<ins>That’s all we know.</ins>")):
-					server := resp.Header.Get("Server")
-					if server != "gws" && !strings.HasPrefix(server, "gvs") {
-						if md := f.GAETransport.MultiDialer; md != nil && md.TLSConnDuration.Len() > 10 {
-							duration = 5 * time.Minute
-						}
-					}
-				}
-
-				if duration > 0 && f.GAETransport.MultiDialer != nil {
-					glog.Warningf("GAE: %s StatusCode is %d, not a gws/gvs ip, add to blacklist for %v", ip, resp.StatusCode, duration)
-					f.GAETransport.MultiDialer.IPBlackList.Set(ip, struct{}{}, time.Now().Add(duration))
-
-					if !helpers.CloseConnectionByRemoteAddr(tr, addr) {
-						glog.Warningf("GAE: CloseConnectionByRemoteAddr(%T, %#v) failed.", tr, addr)
-					}
-				}
-			}
-		}
-		resp.Body.Close()
-		resp.Body = ioutil.NopCloser(bytes.NewReader(body))
 	}
 
 	if resp != nil && resp.Header != nil {

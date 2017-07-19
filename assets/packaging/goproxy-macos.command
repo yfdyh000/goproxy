@@ -1,9 +1,8 @@
-(exec /usr/bin/env python2.7 -x "$0" 2>&1 >/dev/null &);exit
+(/System/Library/Frameworks/Python.framework/Versions/2.7/Resources/Python.app/Contents/MacOS/Python -x "$0" >/dev/null 2>&1 &); exit
+#!/usr/bin/python2.7
 # coding:utf-8
-# Contributor:
-#      Phus Lu        <phuslu@hotmail.com>
 
-__version__ = '1.6'
+__version__ = '2.1'
 
 GOPROXY_TITLE = "GoProxy macOS"
 GOPROXY_ICON_DATA = """\
@@ -34,21 +33,147 @@ import sys
 import subprocess
 import pty
 import os
+import re
+import glob
 import base64
 import ctypes
 import ctypes.util
 
 from PyObjCTools import AppHelper
-from AppKit import *
+from AppKit import NSAlert
+from AppKit import NSApp
+from AppKit import NSAppleScript
+from AppKit import NSApplication
+from AppKit import NSApplicationActivationPolicyProhibited
+from AppKit import NSBackingStoreBuffered
+from AppKit import NSBezelBorder
+from AppKit import NSClosableWindowMask
+from AppKit import NSColor
+from AppKit import NSData
+from AppKit import NSFont
+from AppKit import NSForegroundColorAttributeName
+from AppKit import NSImage
+from AppKit import NSInformationalAlertStyle
+from AppKit import NSMakeRange
+from AppKit import NSMakeRect
+from AppKit import NSMaxY
+from AppKit import NSMenu
+from AppKit import NSMenuItem
+from AppKit import NSMutableAttributedString
+from AppKit import NSNoBorder
+from AppKit import NSObject
+from AppKit import NSScrollView
+from AppKit import NSStatusBar
+from AppKit import NSTextView
+from AppKit import NSTitledWindowMask
+from AppKit import NSUserNotification
+from AppKit import NSUserNotificationCenter
+from AppKit import NSVariableStatusItemLength
+from AppKit import NSViewHeightSizable
+from AppKit import NSViewWidthSizable
+from AppKit import NSWarningAlertStyle
+from AppKit import NSWindow
+from AppKit import NSWorkspace
+from AppKit import NSWorkspaceWillPowerOffNotification
 
-ColorSet=[NSColor.blackColor(), NSColor.colorWithDeviceRed_green_blue_alpha_(0.7578125,0.2109375,0.12890625,1.0), NSColor.colorWithDeviceRed_green_blue_alpha_(0.14453125,0.734375,0.140625,1.0), NSColor.colorWithDeviceRed_green_blue_alpha_(0.67578125,0.67578125,0.15234375,1.0), NSColor.colorWithDeviceRed_green_blue_alpha_(0.28515625,0.1796875,0.87890625,1.0), NSColor.colorWithDeviceRed_green_blue_alpha_(0.82421875,0.21875,0.82421875,1.0), NSColor.colorWithDeviceRed_green_blue_alpha_(0.19921875,0.73046875,0.78125,1.0), NSColor.colorWithDeviceRed_green_blue_alpha_(0.79296875,0.796875,0.80078125,1.0)]
+try:
+    import setproctitle
+    setproctitle.setproctitle(__file__)
+except ImportError:
+    pass
+
+
+ColorSet = [NSColor.whiteColor(),
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.7578125,0.2109375,0.12890625,1.0),
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.14453125,0.734375,0.140625,1.0),
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.67578125,0.67578125,0.15234375,1.0),
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.28515625,0.1796875,0.87890625,1.0),
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.82421875,0.21875,0.82421875,1.0),
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.19921875,0.73046875,0.78125,1.0),
+            NSColor.colorWithDeviceRed_green_blue_alpha_(0.79296875,0.796875,0.80078125,1.0)]
+
+ConsoleFont = NSFont.fontWithName_size_("Monaco", 12.0)
+
+class GoProxyHelpers(object):
+
+    def __init__(self):
+        self.__network_location = ''
+
+    @property
+    def network_location(self):
+        if self.__network_location == '':
+            s = os.popen('system_profiler SPNetworkDataType').read()
+            addrs = re.findall(r'(?is)\s*([^\n]+):\s+Type:\s+(AirPort|Ethernet).+?Addresses:\s*(\S+).+?(?:\n\n|$)', s)
+            self.__network_location = next(n for n,t,a in addrs if re.match('^[0-9a-fA-F\.:]+$', a))
+        return self.__network_location
+
+    def get_current_proxy(self):
+        s = os.popen('scutil --proxy').read()
+        info = dict(re.findall('(?m)^\s+([A-Z]\w+)\s+:\s+(\S+)', s))
+        if info.get('HTTPEnable') == '1':
+            return '%s:%s' % (info['HTTPProxy'], info['HTTPPort'])
+        elif info.get('ProxyAutoConfigEnable') == '1':
+            return info['ProxyAutoConfigURLString']
+        else:
+            return '<None>'
+
+    def set_webproxy(self, host, port):
+        assert isinstance(host, basestring) and isinstance(port, int)
+        cmds = []
+        network = self.network_location
+        cmds.append('networksetup -setwebproxy %s %s %d' % (network, host, port))
+        cmds.append('networksetup -setwebproxystate %s on' % network)
+        cmds.append('networksetup -setsecurewebproxy %s %s %d' % (network, host, port))
+        cmds.append('networksetup -setsecurewebproxystate %s on' % network)
+        cmds.append('networksetup -setautoproxystate %s off' % network)
+        script = '''do shell script "%s" with administrator privileges''' % ' && '.join(cmds)
+        result, error = NSAppleScript.alloc().initWithSource_(script).executeAndReturnError_(None)
+        return result, error
+
+    def set_autoproxy(self, url):
+        cmds = []
+        network = self.network_location
+        cmds.append('networksetup -setautoproxyurl %s %s' % (network, url))
+        cmds.append('networksetup -setautoproxystate %s on' % network)
+        cmds.append('networksetup -setwebproxystate %s off' % network)
+        cmds.append('networksetup -setsecurewebproxystate %s off' % network)
+        script = '''do shell script "%s" with administrator privileges''' % ' && '.join(cmds)
+        result, error = NSAppleScript.alloc().initWithSource_(script).executeAndReturnError_(None)
+        return result, error
+
+    def unset_proxy(self):
+        cmds = []
+        network = self.network_location
+        cmds.append('networksetup -setwebproxystate %s off' % network)
+        cmds.append('networksetup -setsecurewebproxystate %s off' % network)
+        cmds.append('networksetup -setautoproxystate %s off' % network)
+        script = '''do shell script "%s" with administrator privileges''' % ' && '.join(cmds)
+        result, error = NSAppleScript.alloc().initWithSource_(script).executeAndReturnError_(None)
+        return result, error
+
+    def check_update(self):
+        script = '''tell application "Terminal"\nactivate\ndo script "%s/get-latest-goproxy.sh"\nend tell''' % os.getcwd()
+        result, error = NSAppleScript.alloc().initWithSource_(script).executeAndReturnError_(None)
+        return result, error
+
+    def import_rootca(self, certfile):
+        cmds = []
+        if not os.path.isfile(certfile):
+            raise SystemError('File %r not exists.' % certfile)
+        cmds.append('security delete-certificate -c GoProxy')
+        cmds.append('security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain %s' % certfile)
+        script = '''do shell script "%s" with administrator privileges''' % ' ; '.join(cmds)
+        result, error = NSAppleScript.alloc().initWithSource_(script).executeAndReturnError_(None)
+        return result, error
 
 
 class GoProxyMacOS(NSObject):
 
-    console_color=ColorSet[0]
+    console_color = ColorSet[0]
+    max_line_count = 1000
 
     def applicationDidFinishLaunching_(self, notification):
+        self.helper = GoProxyHelpers()
         self.setupUI()
         self.startGoProxy()
         self.notify()
@@ -77,44 +202,57 @@ class GoProxyMacOS(NSObject):
         # Build a very simple menu
         self.menu = NSMenu.alloc().init()
         # Show Menu Item
-        menuitem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Show', 'show:', '')
-        self.menu.addItem_(menuitem)
+        self.menu.addItemWithTitle_action_keyEquivalent_('Show', self.show_, '').setTarget_(self)
         # Hide Menu Item
-        menuitem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Hide', 'hide2:', '')
+        self.menu.addItemWithTitle_action_keyEquivalent_('Hide', self.hide2_, '').setTarget_(self)
+        # Proxy Menu Item
+        self.submenu = NSMenu.alloc().init()
+        self.submenu_titles = [
+            ('<None>', self.setproxy0_),
+            ('http://127.0.0.1:8087/proxy.pac', self.setproxy1_),
+            ('127.0.0.1:8087', self.setproxy2_),
+        ]
+        for title, callback in self.submenu_titles:
+            self.submenu.addItemWithTitle_action_keyEquivalent_(title, callback, '').setTarget_(self)
+        menuitem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Set Proxy', None, '')
+        menuitem.setTarget_(self)
+        menuitem.setSubmenu_(self.submenu)
         self.menu.addItem_(menuitem)
         # Rest Menu Item
-        menuitem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Reload', 'reset:', '')
-        self.menu.addItem_(menuitem)
+        self.menu.addItemWithTitle_action_keyEquivalent_('Import RootCA', self.importca_, '').setTarget_(self)
+        self.menu.addItemWithTitle_action_keyEquivalent_('Check Update', self.checkupdate_, '').setTarget_(self)
+        self.menu.addItemWithTitle_action_keyEquivalent_('Reload', self.reset_, '').setTarget_(self)
         # Default event
-        menuitem = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Quit', 'exit:', '')
-        self.menu.addItem_(menuitem)
+        self.menu.addItemWithTitle_action_keyEquivalent_('Quit', self.exit_, '').setTarget_(self)
         # Bind it to the status item
         self.statusitem.setMenu_(self.menu)
 
         # Console window
-        frame = NSMakeRect(0, 0, 550, 350)
+        frame = NSMakeRect(0, 0, 640, 480)
         self.console_window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(frame, NSClosableWindowMask | NSTitledWindowMask, NSBackingStoreBuffered, False)
         self.console_window.setTitle_(GOPROXY_TITLE)
         self.console_window.setDelegate_(self)
 
         # Console view inside a scrollview
         self.scroll_view = NSScrollView.alloc().initWithFrame_(frame)
-        self.scroll_view.setBorderType_(NSNoBorder)
+        self.scroll_view.setBorderType_(NSBezelBorder)
         self.scroll_view.setHasVerticalScroller_(True)
         self.scroll_view.setHasHorizontalScroller_(False)
         self.scroll_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
 
         self.console_view = NSTextView.alloc().initWithFrame_(frame)
+        self.console_view.setBackgroundColor_(NSColor.blackColor())
         self.console_view.setRichText_(True)
         self.console_view.setVerticallyResizable_(True)
         self.console_view.setHorizontallyResizable_(True)
         self.console_view.setAutoresizingMask_(NSViewWidthSizable)
+        self.console_line_count = 0
 
         self.scroll_view.setDocumentView_(self.console_view)
+        self.console_window.contentView().addSubview_(self.scroll_view)
 
-        contentView = self.console_window.contentView()
-        contentView.addSubview_(self.scroll_view)
-
+        # Update Proxy Menu
+        AppHelper.callLater(1, self.updateproxystate_, None)
         # Hide dock icon
         NSApp.setActivationPolicy_(NSApplicationActivationPolicyProhibited)
 
@@ -130,23 +268,34 @@ class GoProxyMacOS(NSObject):
         self.performSelectorInBackground_withObject_('readProxyOutput', None)
 
     def notify(self):
-        from Foundation import NSUserNotification, NSUserNotificationCenter
         notification = NSUserNotification.alloc().init()
         notification.setTitle_("GoProxy macOS Started.")
         notification.setSubtitle_("")
         notification.setInformativeText_("")
         notification.setSoundName_("NSUserNotificationDefaultSoundName")
         notification.setContentImage_(self.image)
-        NSUserNotificationCenter.defaultUserNotificationCenter().scheduleNotification_(notification)
+        usernotifycenter = NSUserNotificationCenter.defaultUserNotificationCenter()
+        usernotifycenter.removeAllDeliveredNotifications()
+        usernotifycenter.setDelegate_(self)
+        usernotifycenter.scheduleNotification_(notification)
+
+    def userNotificationCenter_didActivateNotification_(self, center, notification):
+        NSUserNotificationCenter.defaultUserNotificationCenter().removeAllDeliveredNotifications()
 
     def stopGoProxy(self):
         self.pipe.terminate()
 
-    def parseLine(self, line):
+    def parseLine_(self, line):
+        if line.startswith('\x1b]2;') and '\x07' in line:
+            global GOPROXY_TITLE
+            pos = line.find('\x07')
+            GOPROXY_TITLE = line[4:pos]
+            self.statusitem.setToolTip_(GOPROXY_TITLE)
+            self.console_window.setTitle_(GOPROXY_TITLE)
+            return self.parseLine_(line[pos:])
         while line.startswith('\x1b['):
             line = line[2:]
             color_number = int(line.split('m',1)[0])
-            print color_number
             if 30 <= color_number < 38:
                 self.console_color = ColorSet[color_number-30]
             elif color_number == 0:
@@ -155,19 +304,52 @@ class GoProxyMacOS(NSObject):
         return line
 
     def refreshDisplay_(self, line):
-        line = self.parseLine(line)
+        line = self.parseLine_(line)
         console_line = NSMutableAttributedString.alloc().initWithString_(line)
         console_line.addAttribute_value_range_(NSForegroundColorAttributeName, self.console_color, NSMakeRange(0,len(line)))
         self.console_view.textStorage().appendAttributedString_(console_line)
+        self.console_view.textStorage().setFont_(ConsoleFont)
         need_scroll = NSMaxY(self.console_view.visibleRect()) >= NSMaxY(self.console_view.bounds())
         if need_scroll:
             range = NSMakeRange(len(self.console_view.textStorage().mutableString()), 0)
             self.console_view.scrollRangeToVisible_(range)
+        # self.console_view.textContainer().setWidthTracksTextView_(False)
+        # self.console_view.textContainer().setContainerSize_((640, 480))
 
     def readProxyOutput(self):
         while(True):
             line = self.pipe_fd.readline()
+            if self.console_line_count > self.max_line_count:
+                self.console_view.setString_('')
+                self.console_line_count = 0
             self.performSelectorOnMainThread_withObject_waitUntilDone_('refreshDisplay:', line, None)
+            self.console_line_count += 1
+
+    def updateproxystate_(self, notification):
+        # Add checkmark to submenu
+        proxy_title = self.helper.get_current_proxy()
+        for title, _ in self.submenu_titles:
+            state = 1 if title == proxy_title else 0
+            self.submenu.itemWithTitle_(title).setState_(state)
+
+    def setproxy0_(self, notification):
+        self.helper.unset_proxy()
+        self.updateproxystate_(notification)
+
+    def setproxy1_(self, notification):
+        self.helper.set_autoproxy('http://127.0.0.1:8087/proxy.pac')
+        self.updateproxystate_(notification)
+
+    def setproxy2_(self, notification):
+        self.helper.set_webproxy('127.0.0.1', 8087)
+        self.updateproxystate_(notification)
+
+    def importca_(self, notification):
+        certfile = './GoProxy.crt'
+        self.helper.import_rootca(certfile)
+
+    def checkupdate_(self, notification):
+        self.helper.check_update()
 
     def show_(self, notification):
         self.console_window.center()
@@ -189,6 +371,42 @@ class GoProxyMacOS(NSObject):
         NSApp.terminate_(self)
 
 
+def get_executables():
+    MAXPATHLEN = 1024
+    PROC_PIDPATHINFO_MAXSIZE = MAXPATHLEN * 4
+    PROC_ALL_PIDS = 1
+    libc = ctypes.CDLL(ctypes.util.find_library('c'))
+    number_of_pids = libc.proc_listpids(PROC_ALL_PIDS, 0, None, 0)
+    pid_list = (ctypes.c_uint32 * (number_of_pids * 2))()
+    libc.proc_listpids(PROC_ALL_PIDS, 0, pid_list, ctypes.sizeof(pid_list))
+    results = []
+    path_size = PROC_PIDPATHINFO_MAXSIZE
+    path_buffer = ctypes.create_string_buffer('\0'*path_size,path_size)
+    for pid in pid_list:
+        # re-use the buffer
+        ctypes.memset(path_buffer, 0, path_size)
+        return_code = libc.proc_pidpath(pid, path_buffer, path_size)
+        if path_buffer.value:
+            results.append((pid, path_buffer.value))
+    return results
+
+
+def precheck():
+    has_user_json = glob.glob('*.user.json') != []
+    if not has_user_json:
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_('Please configure your goproxy at first.')
+        alert.setInformativeText_('For example, add a new gae.user.json')
+        alert.setAlertStyle_(NSWarningAlertStyle)
+        alert.addButtonWithTitle_('OK')
+        NSApp.activateIgnoringOtherApps_(True)
+        pressed = alert.runModal()
+        os.system('open "%s"' % os.path.dirname(__file__))
+    for pid, path in get_executables():
+        if path.endswith('/goproxy'):
+            os.kill(pid, 9)
+
+
 def main():
     global __file__
     __file__ = os.path.abspath(__file__)
@@ -196,6 +414,7 @@ def main():
         __file__ = getattr(os, 'readlink', lambda x: x)(__file__)
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
+    precheck()
     app = NSApplication.sharedApplication()
     delegate = GoProxyMacOS.alloc().init()
     app.setDelegate_(delegate)
@@ -204,3 +423,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

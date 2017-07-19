@@ -91,6 +91,10 @@ func (s *FileStore) Put(name string, header http.Header, data io.ReadCloser) (*h
 
 	filename := filepath.Join(s.Dirname, name)
 
+	if err := os.MkdirAll(filepath.Dir(filename), 0755); err != nil {
+		return nil, err
+	}
+
 	f, err := ioutil.TempFile(filepath.Dir(filename), filepath.Base(filename)+".")
 	if err != nil {
 		return nil, err
@@ -100,6 +104,10 @@ func (s *FileStore) Put(name string, header http.Header, data io.ReadCloser) (*h
 		return nil, err
 	}
 	if err = f.Close(); err != nil {
+		return nil, err
+	}
+
+	if err = os.Chmod(f.Name(), 0644); err != nil {
 		return nil, err
 	}
 

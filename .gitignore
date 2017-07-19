@@ -1,4 +1,5 @@
 build/
+cache/
 *.crt
 *.db
 *.exe
@@ -6,8 +7,14 @@ build/
 *.key
 *.user.json
 addto-startup.vbs
+goproxy.log
+goproxy.log.*.gz
+goproxy.sh
 goproxy-gtk.desktop
 goproxy-gtk.py
 goproxy-logo.png
 goproxy-macos.command
+goproxy-gui.exe
 proxy.pac
+GoProxy.crt
+GoProxy.key
